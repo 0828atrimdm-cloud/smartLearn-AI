@@ -6,7 +6,7 @@ SmartLearn Agent is an AI-powered learning assistant that parses PDF lecture sli
 ## Tech Stack
 - Backend: Python + FastAPI
 - Frontend: React + Vite
-- LLM: OpenRouter (tencent/hy3:free)
+- LLM: OpenRouter (openrouter/free)
 - Vector Search: FAISS (Day 3)
 
 ## Conventions
