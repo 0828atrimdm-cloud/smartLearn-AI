@@ -14,7 +14,7 @@ app = FastAPI(title="SmartLearn Lite API")
 
 allowed_origins = [
     origin.strip()
-    for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+    for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,https://smart-learn-ai-kappa.vercel.app").split(",")
     if origin.strip()
 ]
 
