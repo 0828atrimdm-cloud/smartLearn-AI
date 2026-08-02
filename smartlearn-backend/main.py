@@ -88,7 +88,7 @@ async def upload_pdf(
 def extract_citations(answer: str, pages: list[dict]) -> list[int]:
     """Extract [Page X] numbers from the answer, keeping only those that exist in pages."""
     existing = {p["page"] for p in pages}
-    found = {int(n) for n in re.findall(r"\[Page (\d+)\]", answer)}
+    found = {int(n) for n in re.findall(r"\[Page\s+(\d+)\]", answer)}
     return sorted(found & existing)
 
 
