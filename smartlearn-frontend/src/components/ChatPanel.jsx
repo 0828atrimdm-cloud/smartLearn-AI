@@ -1,3 +1,8 @@
+import ReactMarkdown from "react-markdown";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
+
 export default function ChatPanel({ message, answer, status, error, onChangeMessage, onAsk }) {
   return (
     <div className="card">
@@ -25,7 +30,9 @@ export default function ChatPanel({ message, answer, status, error, onChangeMess
 
       {answer && (
         <div className="answer">
-          <p>{answer.answer}</p>
+          <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
+            {answer.answer}
+          </ReactMarkdown>
           {answer.citations && answer.citations.length > 0 && (
             <div className="citations">
               {answer.citations.map((page) => (
