@@ -1,5 +1,7 @@
+import asyncio
 import os
 import re
+import time
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,7 +26,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "Accept", "Authorization"],
 )
 
-documents: dict[str, list[dict]] = {}
+documents: dict[str, tuple[list[dict], float]] = {}
 
 
 class ChatRequest(BaseModel):
@@ -72,8 +74,8 @@ async def upload_pdf(
             "PDF contains no machine-readable text — OCR is not supported",
         )
 
-    # Store page records keyed by chat session
-    documents[chat_id] = pages
+    # Store page records keyed by chat session, with timestamp for cleanup
+    documents[chat_id] = (pages, time.time())
 
     return {
         "status": "ok",
@@ -92,16 +94,18 @@ def extract_citations(answer: str, pages: list[dict]) -> list[int]:
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    pages = documents.get(request.chat_id)
-    if pages is None:
+    stored = documents.get(request.chat_id)
+    if stored is None:
         raise HTTPException(
             404,
             f"No document uploaded for chat_id '{request.chat_id}'. "
             f"Upload a PDF first via POST /upload?chat_id={request.chat_id}",
         )
 
+    pages, _ = stored
+
     try:
-        answer = answer_from_pages(pages, request.message)
+        answer = await asyncio.to_thread(answer_from_pages, pages, request.message)
     except RuntimeError as e:
         raise HTTPException(502, str(e))
     except Exception:
@@ -109,3 +113,18 @@ async def chat(request: ChatRequest):
 
     citations = extract_citations(answer, pages)
     return {"answer": answer, "citations": citations}
+
+
+async def _cleanup_old_documents():
+    """Remove documents older than 1 hour to prevent unbounded memory growth."""
+    while True:
+        await asyncio.sleep(3600)
+        now = time.time()
+        expired = [cid for cid, (_, ts) in documents.items() if now - ts > 3600]
+        for cid in expired:
+            del documents[cid]
+
+
+@app.on_event("startup")
+async def _startup():
+    asyncio.create_task(_cleanup_old_documents())

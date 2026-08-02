@@ -1,4 +1,6 @@
 import os
+
+import httpx
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -25,6 +27,7 @@ def answer_from_pages(pages: list[dict], message: str) -> str:
     client = OpenAI(
         api_key=api_key,
         base_url="https://openrouter.ai/api/v1",
+        timeout=httpx.Timeout(30.0, connect=10.0),
     )
     response = client.chat.completions.create(
         model=os.getenv("OPENROUTER_MODEL", "openrouter/free"),
