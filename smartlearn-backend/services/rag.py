@@ -365,6 +365,93 @@ def chunk_by_characters(
     return chunks
 
 
+def chunk_with_langchain_recursive(
+    pages: list[dict],
+    chunk_size: int = 500,
+    chunk_overlap: int = 0,
+    separators: list[str] | None = None,
+) -> list[dict]:
+    """Split pages into chunks using LangChain's RecursiveCharacterTextSplitter.
+
+    This splitter tries to break text at the most natural boundary first,
+    then falls back to coarser splits when a chunk still exceeds *chunk_size*.
+    The default separator priority is designed for prose / PDF text:
+
+    1. ``"\\n\\n"``  — paragraph breaks
+    2. ``"\\n"``     — line breaks
+    3. ``" "``       — word boundaries
+    4. ``""``        — character-level fallback (last resort)
+
+    Parameters
+    ----------
+    pages : list[dict]
+        Page records produced by :func:`extract_pages_for_rag`.
+    chunk_size : int
+        Target maximum characters per chunk (default 500).
+    chunk_overlap : int
+        Number of characters shared between consecutive chunks (default 0).
+    separators : list[str] or None
+        Override the default separator priority list.
+        When *None* the default ``["\\n\\n", "\\n", " ", ""]`` is used.
+
+    Returns
+    -------
+    list[dict]
+        Every chunk contains ``chunk_id``, ``page``, ``text``, and
+        ``chunk_mode`` set to ``"langchain_recursive"``.
+
+    Raises
+    ------
+    ImportError
+        If ``langchain-text-splitters`` is not installed.
+    """
+    try:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+    except ImportError:
+        raise ImportError(
+            "langchain-text-splitters is required for langchain_recursive mode. "
+            "Install it with:  pip install langchain-text-splitters"
+        )
+
+    if separators is None:
+        separators = ["\n\n", "\n", " ", ""]
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=separators,
+        keep_separator=True,
+        strip_whitespace=True,
+    )
+
+    chunks: list[dict] = []
+    chunk_id = 0
+
+    for rec in pages:
+        page = rec["page"]
+        text = rec.get("text", "")
+
+        if not text or not text.strip():
+            continue
+
+        pieces = splitter.split_text(text)
+        for piece in pieces:
+            piece = piece.strip()
+            if not piece:
+                continue
+            chunks.append(
+                {
+                    "chunk_id": chunk_id,
+                    "page": page,
+                    "text": piece,
+                    "chunk_mode": "langchain_recursive",
+                }
+            )
+            chunk_id += 1
+
+    return chunks
+
+
 def build_chunks(
     records: list[dict],
     chunk_mode: str,
@@ -412,9 +499,13 @@ def build_chunks(
             )
         return chunk_by_characters(records, chunk_size, overlap=overlap)
 
+    if chunk_mode == "langchain_recursive":
+        return chunk_with_langchain_recursive(records, chunk_size, overlap)
+
     raise ValueError(
         f"Unknown chunk_mode: {chunk_mode!r}. "
-        "Expected 'paragraph', 'character', or 'character_overlap'."
+        "Expected 'paragraph', 'character', 'character_overlap', "
+        "or 'langchain_recursive'."
     )
 
 
@@ -557,10 +648,10 @@ def artifact_paths_for(
     prefix = f"{chunk_mode}_{chunk_size}_{overlap}_"
 
     return {
-        "raw_pages": root / "pages.json",
-        "chunks": root / f"{prefix}chunks.json",
-        "embeddings": root / f"{prefix}embeddings_{tag}.npy",
-        "manifest": root / f"{prefix}manifest_{tag}.json",
+        "raw_pages": root / "raw_pages" / "pages.json",
+        "chunks": root / "chunks" / f"{prefix}chunks.json",
+        "embeddings": root / "embeddings" / f"{prefix}embeddings_{tag}.npy",
+        "manifest": root / "embeddings" / f"{prefix}manifest_{tag}.json",
         "chunk_root": root,
     }
 
