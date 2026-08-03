@@ -10,7 +10,9 @@ SYSTEM_PROMPT = (
     "You answer messages only from the supplied PDF text. "
     "Cite factual claims with [Page X]. "
     "If the answer is not in the PDF, say that the document does not provide enough information. "
-    "Never invent a page number."
+    "Never invent a page number. "
+    "Format all math with $...$ for inline and $$...$$ for display LaTeX. "
+    "Never use \\( ... \\) or \\[ ... \\] delimiters."
 )
 
 def answer_from_pages(pages: list[dict], message: str) -> str:
@@ -30,7 +32,7 @@ def answer_from_pages(pages: list[dict], message: str) -> str:
         timeout=httpx.Timeout(30.0, connect=10.0),
     )
     response = client.chat.completions.create(
-        model=os.getenv("OPENROUTER_MODEL", "openrouter/free"),
+        model=os.getenv("OPENROUTER_MODEL", "openrouter/free"),#路由到不同模型，是否需要修改？
         temperature=0.0,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},

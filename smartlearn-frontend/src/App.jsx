@@ -8,15 +8,16 @@ export default function App() {
   const [upload, setUpload] = useState(null);
   const [message, setMessage] = useState("");
   const [answer, setAnswer] = useState(null);
-  const [status, setStatus] = useState("");
+  const [uploadStatus, setUploadStatus] = useState("");
+  const [askStatus, setAskStatus] = useState("");
   const [error, setError] = useState("");
 
-  const busy = status !== "";
+  const busy = uploadStatus !== "" || askStatus !== "";
 
   async function handleUpload() {
     if (!file || busy) return;
     setError("");
-    setStatus("Uploading…");
+    setUploadStatus("Uploading…");
     try {
       const result = await uploadPDF(file);
       setUpload(result);
@@ -25,7 +26,7 @@ export default function App() {
       setError(e.message);
       setUpload(null);
     } finally {
-      setStatus("");
+      setUploadStatus("");
     }
   }
 
@@ -33,14 +34,14 @@ export default function App() {
     if (!upload || !message.trim() || busy) return;
     setError("");
     setAnswer(null);
-    setStatus("Asking…");
+    setAskStatus("Asking…");
     try {
       const result = await askQuestion(message.trim());
       setAnswer(result);
     } catch (e) {
       setError(e.message);
     } finally {
-      setStatus("");
+      setAskStatus("");
     }
   }
 
@@ -52,7 +53,7 @@ export default function App() {
       <PdfUploader
         file={file}
         upload={upload}
-        status={status}
+        status={uploadStatus}
         error={error}
         onFileChange={setFile}
         onUpload={handleUpload}
@@ -61,7 +62,7 @@ export default function App() {
       <ChatPanel
         message={message}
         answer={answer}
-        status={status}
+        status={askStatus}
         error={error}
         onChangeMessage={setMessage}
         onAsk={handleAsk}
