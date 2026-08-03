@@ -1,7 +1,20 @@
-﻿fastapi
+# Web framework
+fastapi
 uvicorn[standard]
 python-multipart
+pydantic
+
+# PDF processing
 pypdf
+
+# LLM API
 openai
 httpx
+
+# Environment & config
 python-dotenv
+
+# Embedding / RAG pipeline
+sentence-transformers
+torch
+numpy
