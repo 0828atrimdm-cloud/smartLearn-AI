@@ -19,3 +19,4 @@ sentence-transformers
 torch
 numpy
 langchain-text-splitters
+chromadb

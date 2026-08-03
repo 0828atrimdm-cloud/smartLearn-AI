@@ -597,7 +597,9 @@ def load_model(
 
 def embed_texts(
     texts: list[str],
-    model,
+    model=None,
+    model_name: str | None = None,
+    model_cache_dir: str | Path | None = None,
     batch_size: int = 32,
 ):
     """Encode a list of texts into L2-normalised ``float32`` vectors.
@@ -606,8 +608,15 @@ def embed_texts(
     ----------
     texts : list[str]
         Chunk texts to embed.
-    model : SentenceTransformer
-        An already-loaded model.
+    model : SentenceTransformer or str or None
+        An already-loaded model instance, or a HuggingFace model name
+        string (e.g. ``"all-MiniLM-L6-v2"``) to load on demand.
+    model_name : str or None
+        Alternative keyword for passing a model name string.  Ignored
+        when *model* is already provided.
+    model_cache_dir : str or Path or None
+        Local directory for caching downloaded models.  Only used when
+        *model* (or *model_name*) is a name string.
     batch_size : int
         Mini-batch size for encoding (default 32).
 
@@ -620,6 +629,15 @@ def embed_texts(
 
     if not texts:
         return np.empty((0, 0), dtype=np.float32)
+
+    # Resolve: notebook cells may pass model_name= as a keyword instead
+    # of model=, so accept either (model takes precedence).
+    if model is None and model_name is not None:
+        model = model_name
+
+    # Accept either a pre-loaded model instance or a model name string
+    if isinstance(model, str):
+        model = load_model(model, artifact_root=model_cache_dir or "artifacts/rag")
 
     embeddings = model.encode(
         texts,
@@ -1857,3 +1875,317 @@ def evaluate_questions(
         )
 
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# 16. ChromaDB appendix helpers
+# ---------------------------------------------------------------------------
+
+
+def _require_chromadb():
+    """Return the ``chromadb`` module or raise a clear ImportError.
+
+    Returns
+    -------
+    module
+        The imported ``chromadb`` module.
+
+    Raises
+    ------
+    ImportError
+        If ``chromadb`` is not installed.
+    """
+    try:
+        import chromadb  # type: ignore[import-untyped]
+        return chromadb
+    except ImportError:
+        raise ImportError(
+            "chromadb is required for the Chroma retrieval path. "
+            "Install it with:  pip install chromadb"
+        )
+
+
+def ensure_artifact_dirs(
+    artifact_root: str | Path | None = None,
+) -> dict[str, Path]:
+    """Create (if missing) and return all artifact subdirectories.
+
+    Parameters
+    ----------
+    artifact_root : str or Path or None
+        Root directory for all artifacts.  Defaults to ``"artifacts/rag"``.
+
+    Returns
+    -------
+    dict[str, Path]
+        Keys: ``root``, ``raw_pages``, ``chunks``, ``embeddings``,
+        ``faiss``, ``chroma``.
+    """
+    if artifact_root is None:
+        artifact_root = "artifacts/rag"
+    root = Path(artifact_root)
+    dirs: dict[str, Path] = {
+        "root": root,
+        "raw_pages": root / "raw_pages",
+        "chunks": root / "chunks",
+        "embeddings": root / "embeddings",
+        "faiss": root / "faiss",
+        "chroma": root / "chroma",
+    }
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
+def build_chroma_collection(
+    document_id: str,
+    chunks: list[dict],
+    embeddings: "np.ndarray",
+    persist_dir: str | Path,
+) -> dict:
+    """Build and persist one ChromaDB collection from chunks and embeddings.
+
+    Creates a new collection (or replaces an existing one with the same
+    name) inside *persist_dir*.  Stores chunk text as documents and page
+    / chunk_id as metadata so they can be returned at query time.
+
+    Parameters
+    ----------
+    document_id : str
+        Stable identifier used as the collection name.
+    chunks : list[dict]
+        Chunk records (each must have at least ``chunk_id``, ``page``,
+        ``text``).
+    embeddings : np.ndarray
+        Embedding matrix of shape ``(len(chunks), dim)``.
+    persist_dir : str or Path
+        Directory where ChromaDB stores its persisted data.
+
+    Returns
+    -------
+    dict
+        Keys ``collection_name`` (str) and ``item_count`` (int).
+    """
+    import numpy as np  # type: ignore[import-untyped]
+
+    chromadb = _require_chromadb()
+    persist_path = str(Path(persist_dir))
+    client = chromadb.PersistentClient(path=persist_path)
+
+    # Delete any existing collection with the same name so rebuilds are
+    # idempotent (no stale data left behind).
+    try:
+        client.delete_collection(document_id)
+    except Exception:
+        pass
+
+    collection = client.create_collection(
+        name=document_id,
+        metadata={
+            "document_id": document_id,
+            "hnsw:space": "cosine",
+        },
+    )
+
+    ids = [str(c["chunk_id"]) for c in chunks]
+    documents = [c["text"] for c in chunks]
+    metadatas = [
+        {"page": c["page"], "chunk_id": c["chunk_id"]} for c in chunks
+    ]
+
+    collection.add(
+        ids=ids,
+        embeddings=embeddings.astype(np.float32).tolist(),
+        documents=documents,
+        metadatas=metadatas,
+    )
+
+    return {
+        "collection_name": document_id,
+        "item_count": collection.count(),
+    }
+
+
+def query_chroma_collection(
+    document_id: str,
+    query_embedding: "np.ndarray",
+    persist_dir: str | Path,
+    top_k: int,
+) -> list[dict]:
+    """Query a persisted ChromaDB collection for the top-k nearest chunks.
+
+    Parameters
+    ----------
+    document_id : str
+        Collection name to query.
+    query_embedding : np.ndarray
+        L2-normalised query vector of shape ``(1, dim)`` or ``(dim,)``.
+    persist_dir : str or Path
+        ChromaDB persistence directory.
+    top_k : int
+        Number of nearest neighbours to return.
+
+    Returns
+    -------
+    list[dict]
+        Up to *top_k* hits, each with ``chunk_id``, ``page``, ``text``,
+        and ``score`` (cosine similarity, higher is better).
+    """
+    import numpy as np  # type: ignore[import-untyped]
+
+    chromadb = _require_chromadb()
+    client = chromadb.PersistentClient(path=str(Path(persist_dir)))
+    collection = client.get_collection(name=document_id)
+
+    # Ensure query is 2-D
+    q = np.asarray(query_embedding, dtype=np.float32)
+    if q.ndim == 1:
+        q = q.reshape(1, -1)
+
+    n_results = min(top_k, collection.count())
+    results = collection.query(
+        query_embeddings=q.tolist(),
+        n_results=n_results,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    hits: list[dict] = []
+    if results["ids"] and results["ids"][0]:
+        for i in range(len(results["ids"][0])):
+            meta = results["metadatas"][0][i] if results["metadatas"] else {}
+            dist = (
+                float(results["distances"][0][i])
+                if results["distances"]
+                else 0.0
+            )
+            hits.append(
+                {
+                    "chunk_id": meta.get(
+                        "chunk_id", int(results["ids"][0][i])
+                    ),
+                    "page": meta.get("page"),
+                    "text": (
+                        results["documents"][0][i]
+                        if results["documents"]
+                        else ""
+                    ),
+                    "score": round(1.0 - dist, 6),
+                }
+            )
+
+    return hits
+
+
+def search_document_with_chroma(
+    question: str,
+    document: dict,
+    persist_dir: str | Path,
+    top_k: int = 3,
+    batch_size: int = 1,
+) -> list[dict]:
+    """Search a prepared document with ChromaDB for chunks relevant to *question*.
+
+    Embeds the question with the same model used to build the document,
+    queries the persisted Chroma collection, and returns the top *k*
+    hits in the same shape as :func:`search_document`.
+
+    Parameters
+    ----------
+    question : str
+        The user's question.
+    document : dict
+        A document record as returned by :func:`prepare_rag_document`.
+    persist_dir : str or Path
+        ChromaDB persistence directory.
+    top_k : int
+        Number of hits to return (default 3).
+    batch_size : int
+        Mini-batch size passed to the embedding model (default 1).
+
+    Returns
+    -------
+    list[dict]
+        Up to *top_k* hits, each with ``chunk_id``, ``page``, ``text``,
+        and ``score`` fields.
+    """
+    model_name = document.get("model_name", "all-MiniLM-L6-v2")
+    q_vec = embed_texts(
+        [question],
+        model=model_name,
+        batch_size=max(batch_size, 1),
+    )
+
+    return query_chroma_collection(
+        document_id=document["document_id"],
+        query_embedding=q_vec,
+        persist_dir=persist_dir,
+        top_k=top_k,
+    )
+
+
+def answer_document_with_chroma(
+    document: dict,
+    question: str,
+    persist_dir: str | Path,
+    top_k: int = 3,
+    answer_model: str = "openrouter/free",
+) -> dict:
+    """Answer one question against a prepared document using ChromaDB retrieval.
+
+    Retrieves chunks via :func:`search_document_with_chroma`, then either
+    calls the LLM (when ``OPENROUTER_API_KEY`` is set) or falls back to
+    local answer extraction via :func:`best_sentence_answer`.
+
+    Parameters
+    ----------
+    document : dict
+        A document record as returned by :func:`prepare_rag_document`.
+    question : str
+        The user's question.
+    persist_dir : str or Path
+        ChromaDB persistence directory.
+    top_k : int
+        Number of retrieval hits to use (default 3).
+    answer_model : str
+        OpenRouter model id used for LLM answering (default
+        ``"openrouter/free"``).
+
+    Returns
+    -------
+    dict
+        Three keys:
+
+        * ``answer`` — the answer string (LLM or locally extracted)
+        * ``citations`` — sorted list of unique page numbers
+        * ``sources`` — frontend-ready source objects
+    """
+    import os
+
+    # ---- retrieval (Chroma path) ------------------------------------------
+    hits = search_document_with_chroma(
+        question=question,
+        document=document,
+        persist_dir=persist_dir,
+        top_k=top_k,
+    )
+
+    # ---- answer generation -----------------------------------------------
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if api_key:
+        try:
+            answer = _llm_answer_from_hits(
+                question=question,
+                hits=hits,
+                api_key=api_key,
+                model=answer_model,
+            )
+        except Exception:
+            answer = best_sentence_answer(question, hits)
+    else:
+        answer = best_sentence_answer(question, hits)
+
+    # ---- citations & sources --------------------------------------------
+    citations = extract_citations(answer, hits)
+    sources = build_sources(hits)
+
+    return {"answer": answer, "citations": citations, "sources": sources}
