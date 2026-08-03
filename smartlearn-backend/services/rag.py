@@ -48,6 +48,9 @@ def clean_text(text: str) -> str:
     # Collapse three or more consecutive newlines into two
     text = re.sub(r"\n{3,}", "\n\n", text)
 
+    # Join hyphenated words broken across lines (e.g. "speci-\nficity").
+    text = re.sub(r"-\n(?=[a-z])", "", text)
+
     # Heuristic: join lines that were broken mid-sentence.
     # A line ending with a lowercase letter or common mid-sentence punctuation
     # (comma, semicolon, colon) is probably NOT a real paragraph break.
@@ -93,6 +96,16 @@ def extract_pages_for_rag(
                 break
 
     return records
+
+
+def extract_pages_from_bytes_for_rag(pdf_bytes: bytes) -> list[dict]:
+    """Extract page records from uploaded PDF bytes.
+
+    Thin wrapper around :func:`extract_pages_for_rag` for the backend
+    upload route — accepts raw PDF bytes and returns page records in
+    the same ``[{"page": 1, "text": "..."}, ...]`` shape.
+    """
+    return extract_pages_for_rag(pdf_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +605,17 @@ def load_model(
         device = get_device()
 
     source = resolve_model_source(model_name, artifact_root)
-    return SentenceTransformer(source, device=device)
+    # When the model is already cached (custom artifact dir or global
+    # HuggingFace hub cache), skip all network calls — HuggingFace Hub
+    # may be unreachable from some networks.
+    local_only = Path(source).exists()
+    if not local_only:
+        try:
+            from huggingface_hub import try_to_load_from_cache
+            local_only = try_to_load_from_cache(model_name, "config.json") is not None
+        except ImportError:
+            pass
+    return SentenceTransformer(source, device=device, local_files_only=local_only)
 
 
 def embed_texts(
@@ -858,7 +881,7 @@ def prepare_rag_document(
     actual number of chunks), *embedding_dim*, *model_name*,
     *model_source*, an empty *history* list, an *artifacts* block
     with relative paths to the index / chunks / embeddings files, and
-    a *rag_index* block with the active settings.
+    a *rag* block with the active settings.
     """
     if artifact_root is None:
         artifact_root = "artifacts/rag"
@@ -895,7 +918,7 @@ def prepare_rag_document(
             "embeddings": relative_path_str(bundle["embedding_path"], root),
             "raw_pages": relative_path_str(bundle["raw_pages_path"], root),
         },
-        "rag_index": {
+        "rag": {
             "chunk_mode": chunk_mode,
             "chunk_size": chunk_size,
             "overlap": overlap,
@@ -903,6 +926,99 @@ def prepare_rag_document(
             "batch_size": batch_size,
             "artifact_root": str(artifact_root),
         },
+    }
+
+
+def prepare_rag_chat_record(
+    chat_id: str,
+    filename: str,
+    pdf_bytes: bytes | None = None,
+    pages: list[dict] | None = None,
+    upload_root: str | Path | None = None,
+    chunk_mode: str = "character_overlap",
+    chunk_size: int = 700,
+    overlap: int = 120,
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    batch_size: int = 32,
+    artifact_root: str | Path | None = None,
+) -> dict:
+    """Build a richer server-side record at upload time.
+
+    Accepts either pre-extracted *pages* or raw *pdf_bytes*.  When
+    *pdf_bytes* is provided and *pages* is ``None`` the pages are
+    extracted via :func:`extract_pages_from_bytes_for_rag`.  When
+    *upload_root* is given the PDF bytes are saved to disk under
+    ``{upload_root}/{chat_id}/{filename}``.
+
+    The full RAG document (chunks, embeddings, FAISS index) is built
+    via :func:`prepare_rag_document` and the result is enriched with a
+    ``pdf_path`` field, an empty ``history`` list, and a top-level
+    ``chat_id``.
+
+    Returns the record intended to be stored as
+    ``documents[chat_id]``.
+    """
+    if artifact_root is None:
+        artifact_root = "artifacts/rag"
+
+    # ---- resolve pages ----------------------------------------------------
+    if pages is None and pdf_bytes is not None:
+        pages = extract_pages_from_bytes_for_rag(pdf_bytes)
+    if pages is None:
+        raise ValueError("One of 'pages' or 'pdf_bytes' must be provided")
+    if not pages:
+        raise ValueError("No non-empty pages found — cannot build chat record")
+
+    # ---- optionally save the uploaded PDF to disk -------------------------
+    pdf_path: str | None = None
+    if upload_root is not None and pdf_bytes is not None:
+        dest_dir = Path(upload_root) / chat_id
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / filename
+        dest.write_bytes(pdf_bytes)
+        pdf_path = str(dest)
+
+    # ---- build the full RAG document --------------------------------------
+    document = prepare_rag_document(
+        document_id=chat_id,
+        filename=filename,
+        pages=pages,
+        chunk_mode=chunk_mode,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        model_name=model_name,
+        batch_size=batch_size,
+        artifact_root=artifact_root,
+    )
+
+    # ---- enrich with upload-time fields -----------------------------------
+    document["chat_id"] = chat_id
+    if pdf_path:
+        document["saved_pdf_path"] = pdf_path
+    document.setdefault("history", [])
+
+    return document
+
+
+def build_upload_response(document: dict) -> dict:
+    """Produce the visible upload-success JSON for the frontend.
+
+    Extracts a lightweight summary from the richer server-side
+    *document* record returned by :func:`prepare_rag_chat_record`.
+    """
+    pages = document.get("pages", [])
+    return {
+        "document_id": document.get("document_id"),
+        "chat_id": document.get("chat_id"),
+        "filename": document.get("filename"),
+        "num_pages": len(pages),
+        "num_chunks": document.get("chunk_size", 0),
+        "model_name": document.get("model_name"),
+        "page_preview": [
+            {"page": p["page"], "text_preview": p["text"][:120]}
+            for p in pages[:5]
+        ],
+        "artifacts": document.get("artifacts", {}),
     }
 
 
@@ -1307,8 +1423,17 @@ def search_bundle(
     model_name = manifest.get("model_name", "all-MiniLM-L6-v2")
     model = load_model(model_name)
 
-    # ---- embed the question ----------------------------------------------
-    q_vec = embed_texts([question], model, batch_size=max(batch_size, 1))
+    # ---- build context-aware query from recent history -------------------
+    query_text = question
+    if history:
+        last = history[-1]
+        prev_q = last.get("question", "")
+        prev_a = last.get("answer", "")
+        if prev_q or prev_a:
+            query_text = f"{prev_q} {prev_a} {question}"
+
+    # ---- embed the query -------------------------------------------------
+    q_vec = embed_texts([query_text], model, batch_size=max(batch_size, 1))
     q_vec = np.asarray(q_vec, dtype=np.float32).reshape(1, -1)
 
     # ---- semantic search (cosine similarity via inner product) ------------
@@ -1363,7 +1488,7 @@ def search_document(
         The user's question.
     document : dict
         A document record as returned by :func:`prepare_rag_document`.
-        Must contain ``rag_index.artifact_root``, ``model_name``, and
+        Must contain ``rag.artifact_root``, ``model_name``, and
         ``artifacts.index`` / ``artifacts.chunks`` relative paths.
     top_k : int
         Number of hits to return after reranking (default 3).
@@ -1381,7 +1506,7 @@ def search_document(
         ``text``, and ``score`` (higher is better).
     """
     artifact_root = Path(
-        document.get("rag_index", {}).get("artifact_root", "artifacts/rag")
+        document.get("rag", {}).get("artifact_root", "artifacts/rag")
     )
     model_name = document.get("model_name", "all-MiniLM-L6-v2")
 
@@ -1489,6 +1614,56 @@ def best_sentence_answer(question: str, hits: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def build_grounded_user_prompt(
+    question: str,
+    hits: list[dict],
+    history: list[dict] | None = None,
+) -> str:
+    """Format one grounded prompt string for answer generation.
+
+    Combines optional conversation *history*, retrieved evidence from
+    *hits*, and the current *question* into a single user-message
+    string that the LLM can answer directly.
+
+    Parameters
+    ----------
+    question : str
+        The user's current question.
+    hits : list[dict]
+        Top-k retrieved chunks (each with ``page`` and ``text`` keys).
+    history : list[dict] or None
+        Prior Q&A turns from ``document["history"]``.  Each entry is a
+        dict with ``question``, ``answer``, and ``citations`` keys.
+        When provided the last 5 turns are included for context.
+
+    Returns
+    -------
+    str
+        A grounded prompt ready to send as the LLM user message.
+    """
+    parts: list[str] = []
+
+    # ---- conversation history (last 5 turns) ---------------------------
+    if history:
+        parts.append("Previous conversation:")
+        for turn in history[-5:]:
+            parts.append(f"Q: {turn.get('question', '')}")
+            parts.append(f"A: {turn.get('answer', '')}")
+        parts.append("")
+
+    # ---- retrieved evidence --------------------------------------------
+    parts.append("Retrieved evidence from the PDF:")
+    for hit in hits:
+        page = hit.get("page", "?")
+        text = hit.get("text", "")
+        parts.append(f"### [Page {page}]\n{text}")
+
+    # ---- current question ----------------------------------------------
+    parts.append(f"\nQuestion: {question}")
+
+    return "\n\n".join(parts)
+
+
 def extract_citations(answer: str, hits: list[dict] | None = None) -> list[int]:
     """Extract numeric PDF page citations from an answer string and optional hits.
 
@@ -1504,13 +1679,6 @@ def extract_citations(answer: str, hits: list[dict] | None = None) -> list[int]:
     if answer:
         for m in re.finditer(r"(?:page|p\.?)\s*(\d+)", answer, re.IGNORECASE):
             pages.add(int(m.group(1)))
-
-    # Collect page numbers from hits
-    if hits:
-        for hit in hits:
-            p = hit.get("page")
-            if p is not None:
-                pages.add(int(p))
 
     return sorted(pages)
 
@@ -1546,7 +1714,7 @@ def answer_document(
     question: str,
     top_k: int = 3,
     candidate_pool: int = 60,
-    answer_model: str = "openrouter/free",
+    answer_model: str = "poolside/laguna-s-2.1:free",
 ) -> dict:
     """Answer one question against a prepared document record.
 
@@ -1568,7 +1736,7 @@ def answer_document(
         How many candidates to fetch from FAISS for reranking (default 60).
     answer_model : str
         OpenRouter model id used for LLM answering (default
-        ``"openrouter/free"``).
+        ``"poolside/laguna-s-2.1:free"``).
 
     Returns
     -------
@@ -1582,12 +1750,13 @@ def answer_document(
     import os
 
     # ---- retrieval -------------------------------------------------------
+    history = document.get("history")
     hits = search_document(
         question=question,
         document=document,
         top_k=top_k,
         candidate_pool=candidate_pool,
-        history=document.get("history"),
+        history=history,
     )
 
     # ---- answer generation -----------------------------------------------
@@ -1599,6 +1768,7 @@ def answer_document(
                 hits=hits,
                 api_key=api_key,
                 model=answer_model,
+                history=history,
             )
         except Exception:
             # LLM call failed (network, quota, …) → fall back to local
@@ -1618,22 +1788,16 @@ def _llm_answer_from_hits(
     hits: list[dict],
     api_key: str,
     model: str = "openrouter/free",
+    history: list[dict] | None = None,
 ) -> str:
     """Call the OpenRouter LLM with retrieved chunks as context.
 
-    Formats each hit as a ``### [Page X]`` block and sends them
-    alongside *question* to the chat-completions endpoint.
+    Uses :func:`build_grounded_user_prompt` to format the user message
+    with conversation *history* (when provided), retrieved evidence
+    from *hits*, and the current *question*.
     """
     import httpx
     from openai import OpenAI
-
-    # Build PDF-like context from retrieved hits
-    parts: list[str] = []
-    for hit in hits:
-        page = hit.get("page", "?")
-        text = hit.get("text", "")
-        parts.append(f"### [Page {page}]\n{text}")
-    context = "\n\n".join(parts)
 
     client = OpenAI(
         api_key=api_key,
@@ -1651,15 +1815,16 @@ def _llm_answer_from_hits(
         "Never use \\( ... \\) or \\[ ... \\] delimiters."
     )
 
+    user_prompt = build_grounded_user_prompt(
+        question=question, hits=hits, history=history
+    )
+
     response = client.chat.completions.create(
         model=model,
         temperature=0.0,
         messages=[
             {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": f"PDF text:\n{context}\n\nmessage: {question}",
-            },
+            {"role": "user", "content": user_prompt},
         ],
     )
     return response.choices[0].message.content or ""
@@ -1698,6 +1863,94 @@ def append_history(
     }
     document["history"].append(entry)
     return document["history"]
+
+
+def answer_document_turn(
+    document: dict,
+    question: str,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    answer_model: str = "poolside/laguna-s-2.1:free",
+) -> dict:
+    """Answer one question and update the in-memory conversation history.
+
+    Calls :func:`answer_document` for fresh retrieval and answer
+    generation, then appends the Q&A turn to ``document["history"]``
+    via :func:`append_history`.
+
+    Parameters
+    ----------
+    document : dict
+        A document record as returned by :func:`prepare_rag_document`.
+    question : str
+        The user's question.
+    top_k : int
+        Number of retrieval hits to use (default 3).
+    candidate_pool : int
+        How many candidates to fetch from FAISS for reranking (default 60).
+    answer_model : str
+        OpenRouter model id for LLM answering (default
+        ``"poolside/laguna-s-2.1:free"``).
+
+    Returns
+    -------
+    dict
+        Keys ``answer``, ``citations``, ``sources`` — same shape as
+        :func:`answer_document`.  The *document* is mutated in place
+        with the updated history.
+    """
+    result = answer_document(
+        document=document,
+        question=question,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+        answer_model=answer_model,
+    )
+    append_history(document, question, result)
+    return result
+
+
+def answer_chat_turn(
+    document: dict,
+    message: str,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    answer_model: str = "poolside/laguna-s-2.1:free",
+) -> dict:
+    """Answer one chat message with fresh retrieval and in-memory history.
+
+    Convenience entry point for the chat route — identical behaviour
+    to :func:`answer_document_turn`: retrieves fresh evidence for every
+    turn, generates a grounded answer, and appends the turn to
+    ``document["history"]``.
+
+    Parameters
+    ----------
+    document : dict
+        The stored route document record (as built by
+        :func:`prepare_rag_chat_record`).
+    message : str
+        The user's chat message.
+    top_k : int
+        Number of retrieval hits to use (default 3).
+    candidate_pool : int
+        How many candidates to fetch from FAISS for reranking (default 60).
+    answer_model : str
+        OpenRouter model id for LLM answering (default
+        ``"poolside/laguna-s-2.1:free"``).
+
+    Returns
+    -------
+    dict
+        Keys ``answer``, ``citations``, ``sources``.
+    """
+    return answer_document_turn(
+        document=document,
+        question=message,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+        answer_model=answer_model,
+    )
 
 
 # ---------------------------------------------------------------------------

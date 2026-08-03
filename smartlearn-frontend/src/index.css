@@ -21,7 +21,7 @@ body {
 
 /* ── Page layout ──────────────────────────────────── */
 main {
-  width: min(720px, calc(100% - 32px));
+  width: min(1100px, calc(100% - 32px));
   margin: 40px auto 64px;
 }
 
@@ -234,4 +234,112 @@ button:disabled {
 textarea:focus {
   border-color: #2563eb;
   outline: none;
+}
+
+/* ── Two-column workspace ─────────────────────────── */
+.workspace {
+  display: flex;
+  gap: 20px;
+  align-items: flex-start;
+}
+
+.pdf-column,
+.chat-column {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ── PDF preview ─────────────────────────────────── */
+.pdf-preview {
+  padding: 12px;
+}
+
+.pdf-frame {
+  width: 100%;
+  height: 550px;
+  border: none;
+  border-radius: 6px;
+}
+
+.pdf-placeholder {
+  height: 574px; /* 550 + 12 + 12 padding from .pdf-preview */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.pdf-placeholder p {
+  color: #5f6b7a;
+  font-size: 0.9rem;
+}
+
+/* ── Chat card ───────────────────────────────────── */
+.chat-card {
+  height: 574px; /* match pdf-preview total height */
+  display: flex;
+  flex-direction: column;
+}
+
+.message-list {
+  flex: 1;
+  overflow-y: auto;
+  padding-right: 4px;
+  margin-bottom: 14px;
+}
+
+.chat-hint {
+  color: #9ca3af;
+  font-size: 0.875rem;
+  font-style: italic;
+}
+
+.message {
+  margin-bottom: 14px;
+}
+
+.message.user p {
+  background: #eff6ff;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 0.9rem;
+  display: inline-block;
+  max-width: 100%;
+  word-break: break-word;
+}
+
+.message.assistant {
+  font-size: 0.9rem;
+  line-height: 1.7;
+}
+
+.message.assistant p {
+  margin-bottom: 0.5em;
+}
+
+.message.assistant p:last-child {
+  margin-bottom: 0;
+}
+
+/* ── Clickable citation buttons ──────────────────── */
+.citation-btn {
+  all: unset;
+  cursor: pointer;
+  display: inline-block;
+  font-size: 0.8rem;
+  font-weight: 500;
+  padding: 3px 10px;
+  background: #eff6ff;
+  color: #1e40af;
+  border: 1px solid #bfdbfe;
+  border-radius: 999px;
+  transition: background 0.15s;
+}
+
+.citation-btn:hover {
+  background: #dbeafe;
+}
+
+.citation-btn:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
 }

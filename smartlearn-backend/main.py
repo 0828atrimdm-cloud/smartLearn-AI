@@ -1,14 +1,18 @@
 import asyncio
 import os
-import re
 import time
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from .services.pdf import extract_pages
-from .services.llm import answer_from_pages
+from .services.rag import prepare_rag_chat_record, answer_chat_turn
 
 app = FastAPI(title="SmartLearn Lite API")
 
@@ -26,7 +30,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "Accept", "Authorization"],
 )
 
-documents: dict[str, tuple[list[dict], float]] = {}
+documents: dict[str, dict] = {}
 
 
 class ChatRequest(BaseModel):
@@ -60,13 +64,20 @@ async def upload_pdf(
     if not pdf_bytes:
         raise HTTPException(400, "Uploaded file is empty")
 
-    # Extract pages
+    # Build the richer RAG-ready record in one call
+    # (pages → chunks → embeddings → FAISS, plus PDF save to disk)
     try:
-        pages = extract_pages(pdf_bytes)
+        document = prepare_rag_chat_record(
+            chat_id=chat_id,
+            filename=file.filename,
+            pdf_bytes=pdf_bytes,
+            upload_root="uploads",
+        )
     except ValueError as e:
         raise HTTPException(400, str(e))
 
     # Reject zero readable text
+    pages = document["pages"]
     total_chars = sum(len(p["text"]) for p in pages)
     if total_chars == 0:
         raise HTTPException(
@@ -74,8 +85,11 @@ async def upload_pdf(
             "PDF contains no machine-readable text — OCR is not supported",
         )
 
-    # Store page records keyed by chat session, with timestamp for cleanup
-    documents[chat_id] = (pages, time.time())
+    # Stamp with upload time for the periodic cleanup task
+    document["uploaded_at"] = time.time()
+
+    # Store the richer record — only on success so no half-written state
+    documents[chat_id] = document
 
     return {
         "status": "ok",
@@ -85,11 +99,18 @@ async def upload_pdf(
     }
 
 
-def extract_citations(answer: str, pages: list[dict]) -> list[int]:
-    """Extract [Page X] numbers from the answer, keeping only those that exist in pages."""
-    existing = {p["page"] for p in pages}
-    found = {int(n) for n in re.findall(r"\[Page\s+(\d+)\]", answer)}
-    return sorted(found & existing)
+@app.get("/documents/{chat_id}/file")
+async def serve_uploaded_pdf(chat_id: str):
+    """Serve the uploaded PDF file for a chat session."""
+    document = documents.get(chat_id)
+    if document is None:
+        raise HTTPException(404, f"No document found for chat_id '{chat_id}'")
+
+    saved_path = document.get("saved_pdf_path")
+    if not saved_path or not Path(saved_path).exists():
+        raise HTTPException(404, f"PDF file not found for chat_id '{chat_id}'")
+
+    return FileResponse(saved_path, media_type="application/pdf")
 
 
 @app.post("/chat")
@@ -102,17 +123,21 @@ async def chat(request: ChatRequest):
             f"Upload a PDF first via POST /upload?chat_id={request.chat_id}",
         )
 
-    pages, _ = stored
-
     try:
-        answer = await asyncio.to_thread(answer_from_pages, pages, request.message)
-    except RuntimeError as e:
-        raise HTTPException(502, str(e))
+        result = await asyncio.to_thread(
+            answer_chat_turn,
+            document=stored,
+            message=request.message,
+            top_k=3,
+            candidate_pool=60,
+            answer_model="poolside/laguna-s-2.1:free",
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(500, f"RAG artifact missing: {e}")
     except Exception:
         raise HTTPException(502, "Upstream AI service failed")
 
-    citations = extract_citations(answer, pages)
-    return {"answer": answer, "citations": citations}
+    return result
 
 
 async def _cleanup_old_documents():
@@ -120,7 +145,11 @@ async def _cleanup_old_documents():
     while True:
         await asyncio.sleep(3600)
         now = time.time()
-        expired = [cid for cid, (_, ts) in documents.items() if now - ts > 3600]
+        expired = [
+            cid
+            for cid, doc in documents.items()
+            if now - doc.get("uploaded_at", 0) > 3600
+        ]
         for cid in expired:
             del documents[cid]
 
