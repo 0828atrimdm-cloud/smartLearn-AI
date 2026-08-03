@@ -9,6 +9,7 @@ Day 3 preparation:
   - embedding pipeline: model loading, text encoding, artifact persistence
 """
 
+import hashlib
 import json
 import re
 from io import BytesIO
@@ -64,17 +65,22 @@ def clean_text(text: str) -> str:
 # 2. PDF extraction (RAG-friendly — no hard page cap)
 # ---------------------------------------------------------------------------
 
-def extract_pages_for_rag(pdf_input: bytes | str | Path) -> list[dict]:
+def extract_pages_for_rag(
+    file_path: bytes | str | Path,
+    page_limit: int | None = None,
+) -> list[dict]:
     """Read a PDF page by page, keeping original PDF page numbers.
 
-    *pdf_input* may be raw PDF bytes or a file path (``str`` or ``Path``).
-    Returns only pages whose cleaned text is non-empty.  No hard page
-    limit — the caller decides how many pages to process.
+    *file_path* may be raw PDF bytes or a file path (``str`` or ``Path``).
+    When *page_limit* is set only the first *page_limit* non-empty pages
+    are returned (``None`` means no limit).
+
+    Returns only pages whose cleaned text is non-empty.
     """
-    if isinstance(pdf_input, (str, Path)):
-        pdf_bytes = Path(pdf_input).read_bytes()
+    if isinstance(file_path, (str, Path)):
+        pdf_bytes = Path(file_path).read_bytes()
     else:
-        pdf_bytes = pdf_input
+        pdf_bytes = file_path
     reader = PdfReader(BytesIO(pdf_bytes))
 
     records: list[dict] = []
@@ -83,6 +89,8 @@ def extract_pages_for_rag(pdf_input: bytes | str | Path) -> list[dict]:
         cleaned = clean_text(raw)
         if cleaned:                         # drop empty pages
             records.append({"page": page_number, "text": cleaned})
+            if page_limit is not None and len(records) >= page_limit:
+                break
 
     return records
 
@@ -640,6 +648,8 @@ def artifact_paths_for(
     * ``chunks``          — path to saved chunk records
     * ``embeddings``      — path to the ``.npy`` embedding matrix
     * ``manifest``        — path to the JSON manifest
+    * ``faiss_index``     — path to the ``.faiss`` binary index
+    * ``faiss_meta``      — path to the FAISS metadata JSON
     * ``chunk_root``      — directory shared by chunks / embeddings / manifest
     """
     root = Path(artifact_root) / _safe_name(document_id)
@@ -652,6 +662,8 @@ def artifact_paths_for(
         "chunks": root / "chunks" / f"{prefix}chunks.json",
         "embeddings": root / "embeddings" / f"{prefix}embeddings_{tag}.npy",
         "manifest": root / "embeddings" / f"{prefix}manifest_{tag}.json",
+        "faiss_index": root / "faiss" / f"{prefix}index_{tag}.faiss",
+        "faiss_meta": root / "faiss" / f"{prefix}faiss_meta_{tag}.json",
         "chunk_root": root,
     }
 
@@ -781,3 +793,1067 @@ def ensure_artifacts(
     save_json(manifest, manifest_path)
 
     return {"manifest": manifest, "chunks": chunk_records, "embeddings": embeddings}
+
+
+# ---------------------------------------------------------------------------
+# 7. Path display helper
+# ---------------------------------------------------------------------------
+
+
+def relative_path_str(path: str | Path, base: str | Path) -> str:
+    """Return *path* as a string relative to *base* when possible.
+
+    When *path* does not live under *base* the original absolute (or
+    relative) string is returned unchanged.
+    """
+    p = Path(path)
+    try:
+        return str(p.resolve().relative_to(Path(base).resolve()))
+    except ValueError:
+        return str(path)
+
+
+# ---------------------------------------------------------------------------
+# 8. Server-style document record
+# ---------------------------------------------------------------------------
+
+
+def prepare_rag_document(
+    document_id: str,
+    filename: str,
+    pages: list[dict],
+    chunk_mode: str = "character_overlap",
+    chunk_size: int = 700,
+    overlap: int = 120,
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    batch_size: int = 32,
+    artifact_root: str | Path | None = None,
+) -> dict:
+    """Build (or reuse) a complete RAG document record.
+
+    This is the server-facing entry point: it runs the full
+    pages → chunks → embeddings → FAISS pipeline and returns a dict
+    that can be stored in ``documents[document_id]`` for later
+    retrieval and answering.
+
+    The returned dict carries *pages*, *chunks*, *chunk_size* (the
+    actual number of chunks), *embedding_dim*, *model_name*,
+    *model_source*, an empty *history* list, an *artifacts* block
+    with relative paths to the index / chunks / embeddings files, and
+    a *rag_index* block with the active settings.
+    """
+    if artifact_root is None:
+        artifact_root = "artifacts/rag"
+
+    # Run the full build-or-reuse pipeline --------------------------------
+    bundle = ensure_index(
+        document_id=document_id,
+        pdf_name=filename,
+        pages=pages,
+        chunk_mode=chunk_mode,
+        model_name=model_name,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        batch_size=batch_size,
+        artifact_root=artifact_root,
+    )
+
+    model_source = resolve_model_source(model_name, artifact_root)
+    root = Path(artifact_root)
+
+    return {
+        "document_id": document_id,
+        "filename": filename,
+        "pages": pages,
+        "chunks": bundle["chunks"],
+        "chunk_size": len(bundle["chunks"]),
+        "embedding_dim": int(bundle["embeddings"].shape[1]),
+        "model_name": model_name,
+        "model_source": str(model_source),
+        "history": [],
+        "artifacts": {
+            "index": relative_path_str(bundle["faiss_path"], root),
+            "chunks": relative_path_str(bundle["chunk_path"], root),
+            "embeddings": relative_path_str(bundle["embedding_path"], root),
+            "raw_pages": relative_path_str(bundle["raw_pages_path"], root),
+        },
+        "rag_index": {
+            "chunk_mode": chunk_mode,
+            "chunk_size": chunk_size,
+            "overlap": overlap,
+            "model_name": model_name,
+            "batch_size": batch_size,
+            "artifact_root": str(artifact_root),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# 9. FAISS index helpers
+# ---------------------------------------------------------------------------
+
+
+def build_faiss_index(embeddings: "np.ndarray") -> "faiss.Index":
+    """Build a FAISS inner-product index from **L2-normalised** embedding vectors.
+
+    Because the input vectors are already normalised (‖v‖ = 1), inner
+    product is equivalent to cosine similarity:
+
+        cos(u, v) = u·v / (‖u‖·‖v‖) = u·v   (when ‖u‖ = ‖v‖ = 1)
+
+    Using ``IndexFlatIP`` is therefore an **exact** cosine-similarity
+    search — no approximation, no extra normalisation at query time.
+    """
+    import faiss  # type: ignore[import-untyped]
+
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    index.add(embeddings)
+    return index
+
+
+def save_faiss_index(index: "faiss.Index", index_path: str | Path) -> None:
+    """Write one FAISS index to a binary ``.faiss`` file on disk.
+
+    Parent directories are created automatically when they don't exist yet.
+    """
+    import faiss  # type: ignore[import-untyped]
+
+    path = Path(index_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    faiss.write_index(index, str(path))
+
+
+def load_faiss_index(index_path: str | Path) -> "faiss.Index":
+    """Read a FAISS index from a ``.faiss`` file back into memory."""
+    import faiss  # type: ignore[import-untyped]
+
+    return faiss.read_index(str(Path(index_path)))
+
+
+# ---------------------------------------------------------------------------
+# 10. Configuration signature (cache-busting)
+# ---------------------------------------------------------------------------
+
+
+def _config_signature(
+    chunk_mode: str,
+    chunk_size: int,
+    overlap: int,
+    model_name: str,
+    num_chunks: int,
+    embedding_dim: int,
+) -> str:
+    """Short deterministic hash of the parameters that affect the FAISS index.
+
+    When any of these values change the index must be rebuilt; when they
+    stay the same a cached ``.faiss`` file can be reused.
+    """
+    payload = (
+        f"{chunk_mode}|{chunk_size}|{overlap}|"
+        f"{model_name}|{num_chunks}|{embedding_dim}"
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# 11. High-level ensure_index (pages → chunks → embeddings → FAISS)
+# ---------------------------------------------------------------------------
+
+
+def ensure_index(
+    document_id: str,
+    pdf_name: str,
+    pages: list[dict] | None = None,
+    pdf_path: str | Path | None = None,
+    chunk_mode: str = "character_overlap",
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    chunk_size: int = 700,
+    overlap: int = 120,
+    batch_size: int = 32,
+    artifact_root: str | Path | None = None,
+) -> dict:
+    """Build or reuse the complete RAG pipeline including a FAISS index.
+
+    This is the one-stop helper for a notebook cell: feed it a PDF (or
+    pre-extracted pages) and get back chunks, embeddings, a FAISS index,
+    and all the saved artifact paths.
+
+    On the first call the function extracts pages, chunks, embeds, builds
+    a FAISS ``IndexFlatIP``, and persists everything to disk.  On later
+    calls with the same configuration it reloads the cached ``.faiss``
+    file — as long as the configuration *signature* hasn't changed.
+
+    Parameters
+    ----------
+    document_id : str
+        Stable identifier for the document (e.g. ``"day3-demo"``).
+    pdf_name : str
+        Human-readable label for the PDF (used in path names).
+    pages : list[dict] or None
+        Pre-extracted page records ``[{"page":1, "text":"..."}, ...]``.
+        When *None*, *pdf_path* must be provided.
+    pdf_path : str or Path or None
+        Path to a PDF file to extract pages from.  Only used when
+        *pages* is *None*.
+    chunk_mode : str
+        One of ``"paragraph"``, ``"character"``, ``"character_overlap"``,
+        or ``"langchain_recursive"`` (default ``"character_overlap"``).
+    model_name : str
+        HuggingFace model id (default ``"sentence-transformers/all-MiniLM-L6-v2"``).
+    chunk_size : int
+        Max characters per chunk (default 700).
+    overlap : int
+        Character overlap for sliding-window modes (default 120).
+    batch_size : int
+        Mini-batch size for the embedding model (default 32).
+    artifact_root : str or Path or None
+        Root directory for all artifacts.  Defaults to ``"artifacts/rag"``.
+
+    Returns
+    -------
+    dict
+        Bundle with keys: ``chunks``, ``embeddings``, ``manifest``,
+        ``index`` (the FAISS ``IndexFlatIP``), ``faiss_path``,
+        ``faiss_meta_path``, ``chunk_path``, ``embedding_path``,
+        ``raw_pages_path``.
+    """
+    import numpy as np  # type: ignore[import-untyped]
+
+    if artifact_root is None:
+        artifact_root = "artifacts/rag"
+
+    # ---- resolve pages --------------------------------------------------------
+    if pages is not None:
+        page_records = list(pages)
+    elif pdf_path is not None:
+        page_records = extract_pages_for_rag(pdf_path)
+    else:
+        raise ValueError("One of 'pages' or 'pdf_path' must be provided")
+
+    if not page_records:
+        raise ValueError("No non-empty pages found — cannot build index")
+
+    # ---- resolve artifact paths -----------------------------------------------
+    paths = artifact_paths_for(
+        document_id=document_id,
+        pdf_name=pdf_name,
+        model_name=model_name,
+        chunk_mode=chunk_mode,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        artifact_root=artifact_root,
+    )
+
+    # ---- 1. raw pages ---------------------------------------------------------
+    save_json(page_records, paths["raw_pages"])
+
+    # ---- 2. chunks ------------------------------------------------------------
+    chunk_records = build_chunks(page_records, chunk_mode, chunk_size, overlap)
+    if not chunk_records:
+        raise ValueError(
+            "Chunking produced zero chunks — check chunk_size / page content"
+        )
+    save_json(chunk_records, paths["chunks"])
+
+    # ---- 3. embeddings --------------------------------------------------------
+    device = get_device()
+    model = load_model(model_name, device=device, artifact_root=artifact_root)
+    texts = [c["text"] for c in chunk_records]
+    embeddings = embed_texts(texts, model, batch_size=batch_size)
+    paths["embeddings"].parent.mkdir(parents=True, exist_ok=True)
+    np.save(str(paths["embeddings"]), embeddings)
+
+    # ---- 4. configuration signature -------------------------------------------
+    sig = _config_signature(
+        chunk_mode=chunk_mode,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        model_name=model_name,
+        num_chunks=len(chunk_records),
+        embedding_dim=int(embeddings.shape[1]),
+    )
+
+    # ---- 5. reuse cached FAISS index when signature still matches -------------
+    faiss_meta_path: Path = paths["faiss_meta"]
+    if faiss_meta_path.exists() and paths["faiss_index"].exists():
+        try:
+            cached_meta = load_json(faiss_meta_path)
+            if cached_meta.get("signature") == sig:
+                index = load_faiss_index(paths["faiss_index"])
+
+                manifest = _build_manifest(
+                    document_id=document_id,
+                    pdf_name=pdf_name,
+                    num_pages=len(page_records),
+                    num_chunks=len(chunk_records),
+                    chunk_mode=chunk_mode,
+                    chunk_size=chunk_size,
+                    overlap=overlap,
+                    model_name=model_name,
+                    device=device,
+                    embedding_dim=int(embeddings.shape[1]),
+                    paths=paths,
+                )
+                save_json(manifest, paths["manifest"])
+
+                return {
+                    "chunks": chunk_records,
+                    "embeddings": embeddings,
+                    "manifest": manifest,
+                    "index": index,
+                    "faiss_path": str(paths["faiss_index"]),
+                    "faiss_meta_path": str(faiss_meta_path),
+                    "chunk_path": str(paths["chunks"]),
+                    "embedding_path": str(paths["embeddings"]),
+                    "raw_pages_path": str(paths["raw_pages"]),
+                }
+        except Exception:
+            # Any hiccup (corrupt index, missing file, …) → rebuild
+            pass
+
+    # ---- 6. build & persist fresh FAISS index ---------------------------------
+    index = build_faiss_index(embeddings)
+    save_faiss_index(index, paths["faiss_index"])
+
+    faiss_meta = {
+        "signature": sig,
+        "chunk_mode": chunk_mode,
+        "chunk_size": chunk_size,
+        "overlap": overlap,
+        "model_name": model_name,
+        "num_chunks": len(chunk_records),
+        "embedding_dim": int(embeddings.shape[1]),
+        "faiss_index_path": str(paths["faiss_index"]),
+    }
+    save_json(faiss_meta, faiss_meta_path)
+
+    # ---- 7. manifest ----------------------------------------------------------
+    manifest = _build_manifest(
+        document_id=document_id,
+        pdf_name=pdf_name,
+        num_pages=len(page_records),
+        num_chunks=len(chunk_records),
+        chunk_mode=chunk_mode,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        model_name=model_name,
+        device=device,
+        embedding_dim=int(embeddings.shape[1]),
+        paths=paths,
+    )
+    save_json(manifest, paths["manifest"])
+
+    return {
+        "chunks": chunk_records,
+        "embeddings": embeddings,
+        "manifest": manifest,
+        "index": index,
+        "faiss_path": str(paths["faiss_index"]),
+        "faiss_meta_path": str(faiss_meta_path),
+        "chunk_path": str(paths["chunks"]),
+        "embedding_path": str(paths["embeddings"]),
+        "raw_pages_path": str(paths["raw_pages"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 12. Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_manifest(
+    document_id: str,
+    pdf_name: str,
+    num_pages: int,
+    num_chunks: int,
+    chunk_mode: str,
+    chunk_size: int,
+    overlap: int,
+    model_name: str,
+    device: str,
+    embedding_dim: int,
+    paths: dict,
+) -> dict:
+    """Assemble a manifest dict describing one fully-built RAG document."""
+    return {
+        "document_id": document_id,
+        "pdf_name": pdf_name,
+        "num_pages": num_pages,
+        "chunk_mode": chunk_mode,
+        "chunk_size": chunk_size,
+        "overlap": overlap,
+        "model_name": model_name,
+        "num_chunks": num_chunks,
+        "embedding_dim": embedding_dim,
+        "device": device,
+        "chunk_path": str(paths["chunks"]),
+        "embedding_path": str(paths["embeddings"]),
+        "raw_pages_path": str(paths["raw_pages"]),
+        "faiss_index_path": str(paths["faiss_index"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 13. Retrieval helpers
+# ---------------------------------------------------------------------------
+
+# Lightweight English stop-word list for lexical token filtering.
+# Kept small and inline so the reranker stays easy to explain.
+_STOP_WORDS: set[str] = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
+    "being", "have", "has", "had", "do", "does", "did", "will", "would",
+    "could", "should", "may", "might", "can", "shall", "not", "no", "nor",
+    "so", "if", "then", "than", "that", "this", "these", "those", "it",
+    "its", "we", "you", "he", "she", "they", "me", "us", "him", "her",
+    "them", "my", "your", "his", "our", "their", "what", "which", "who",
+    "whom", "when", "where", "how", "all", "each", "every", "both", "few",
+    "more", "most", "other", "some", "such", "only", "own", "same", "into",
+    "over", "also", "very", "just", "about", "above", "after", "again",
+    "any", "as", "up", "out", "down", "off", "here", "there",
+}
+
+
+def keyword_set(text: str) -> set[str]:
+    """Extract lightweight lexical tokens from *text* for simple reranking.
+
+    Lowercases the input, splits on word boundaries, then drops common
+    English stop words and tokens shorter than 3 characters.  Returns a
+    set of lowercase keyword strings suitable for Jaccard-style overlap
+    scoring in :func:`_lexical_score`.
+    """
+    if not text:
+        return set()
+    tokens = re.findall(r"[a-zA-Z0-9]{3,}", text.lower())
+    return {t for t in tokens if t not in _STOP_WORDS}
+
+
+def _lexical_score(question_kw: set[str], chunk_kw: set[str]) -> float:
+    """Fraction of question keywords that appear in the chunk text.
+
+    This is a recall-oriented measure: a score of 1.0 means every
+    question keyword was found in the chunk.  Returns 0.0 when the
+    question yields no keywords (all stop words or too short).
+    """
+    if not question_kw:
+        return 0.0
+    return len(question_kw & chunk_kw) / len(question_kw)
+
+
+def search_bundle(
+    question: str,
+    bundle: dict,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    batch_size: int = 1,
+    history: list[dict] | None = None,
+) -> list[dict]:
+    """Search an in-memory FAISS index bundle for chunks relevant to *question*.
+
+    Embeds the question with the same model used to build the index,
+    retrieves *candidate_pool* nearest neighbours via cosine similarity
+    (inner product on L2-normalised vectors), applies a lightweight
+    lexical rerank (90 % semantic + 10 % keyword overlap), and returns
+    the top *k* hits.
+
+    Parameters
+    ----------
+    question : str
+        The user's question.
+    bundle : dict
+        An in-memory bundle as returned by :func:`ensure_index`.  Must
+        contain at least ``index`` (a FAISS index), ``chunks`` (list of
+        chunk dicts), and ``manifest`` (with ``model_name``).
+    top_k : int
+        Number of hits to return after reranking (default 3).
+    candidate_pool : int
+        How many candidates to fetch from FAISS for the rerank step
+        (default 60).  Clamped to the actual index size.
+    batch_size : int
+        Mini-batch size passed to the embedding model (default 1).
+    history : list[dict] or None
+        Optional conversation history.  Accepted for future
+        context-aware retrieval; not yet used in scoring.
+
+    Returns
+    -------
+    list[dict]
+        Up to *top_k* hits, each with keys ``page``, ``chunk_id``,
+        ``text``, and ``score`` (higher is better, range ~ [0, 1]).
+    """
+    import numpy as np
+
+    # ---- resolve embedding model -----------------------------------------
+    manifest = bundle.get("manifest", {})
+    model_name = manifest.get("model_name", "all-MiniLM-L6-v2")
+    model = load_model(model_name)
+
+    # ---- embed the question ----------------------------------------------
+    q_vec = embed_texts([question], model, batch_size=max(batch_size, 1))
+    q_vec = np.asarray(q_vec, dtype=np.float32).reshape(1, -1)
+
+    # ---- semantic search (cosine similarity via inner product) ------------
+    index = bundle["index"]
+    chunks = bundle["chunks"]
+    pool_size = min(candidate_pool, index.ntotal)
+    scores, indices = index.search(q_vec, pool_size)
+
+    # ---- build candidate hits with combined scores -----------------------
+    q_kw = keyword_set(question)
+    candidates: list[dict] = []
+
+    for i in range(pool_size):
+        idx = int(indices[0][i])
+        if idx < 0 or idx >= len(chunks):
+            continue
+        chunk = chunks[idx]
+        sem_score = float(scores[0][i])
+        lex_score = _lexical_score(q_kw, keyword_set(chunk.get("text", "")))
+        # 90 % semantic + 10 % lexical — simple, explainable blend
+        combined = 0.9 * sem_score + 0.1 * lex_score
+        candidates.append(
+            {
+                "page": chunk.get("page"),
+                "chunk_id": chunk.get("chunk_id"),
+                "text": chunk.get("text", ""),
+                "score": round(combined, 6),
+            }
+        )
+
+    # ---- rerank by combined score, keep top-k ----------------------------
+    candidates.sort(key=lambda h: h["score"], reverse=True)
+    return candidates[:top_k]
+
+
+def search_document(
+    question: str,
+    document: dict,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    history: list[dict] | None = None,
+) -> list[dict]:
+    """Search a prepared document record for chunks relevant to *question*.
+
+    Loads the saved FAISS index and chunk file from disk (using paths
+    stored in *document*), runs semantic retrieval with light lexical
+    reranking, and returns the top *k* hits.
+
+    Parameters
+    ----------
+    question : str
+        The user's question.
+    document : dict
+        A document record as returned by :func:`prepare_rag_document`.
+        Must contain ``rag_index.artifact_root``, ``model_name``, and
+        ``artifacts.index`` / ``artifacts.chunks`` relative paths.
+    top_k : int
+        Number of hits to return after reranking (default 3).
+    candidate_pool : int
+        How many candidates to fetch from FAISS for the rerank step
+        (default 60).
+    history : list[dict] or None
+        Optional conversation history.  Accepted for future
+        context-aware retrieval; not yet used in scoring.
+
+    Returns
+    -------
+    list[dict]
+        Up to *top_k* hits, each with keys ``page``, ``chunk_id``,
+        ``text``, and ``score`` (higher is better).
+    """
+    artifact_root = Path(
+        document.get("rag_index", {}).get("artifact_root", "artifacts/rag")
+    )
+    model_name = document.get("model_name", "all-MiniLM-L6-v2")
+
+    # Resolve absolute artifact paths from the document record
+    index_rel = document.get("artifacts", {}).get("index", "")
+    chunks_rel = document.get("artifacts", {}).get("chunks", "")
+
+    index_path = artifact_root / index_rel
+    chunks_path = artifact_root / chunks_rel
+
+    if not index_path.exists():
+        raise FileNotFoundError(f"FAISS index not found at {index_path}")
+    if not chunks_path.exists():
+        raise FileNotFoundError(f"Chunks file not found at {chunks_path}")
+
+    # Load from disk
+    index = load_faiss_index(index_path)
+    chunks_list = load_json(chunks_path)
+
+    # Delegate to the in-memory search engine
+    bundle = {
+        "index": index,
+        "chunks": chunks_list,
+        "manifest": {"model_name": model_name},
+    }
+    return search_bundle(
+        question=question,
+        bundle=bundle,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+        history=history,
+    )
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split *text* into candidate answer sentences.
+
+    Breaks on sentence-ending punctuation (``.``, ``!``, ``?``) followed
+    by whitespace or end-of-string.  Returns only non-empty, stripped
+    sentences.
+    """
+    if not text or not text.strip():
+        return []
+    raw = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [s.strip() for s in raw if s.strip()]
+
+
+def best_sentence_answer(question: str, hits: list[dict]) -> str:
+    """Pick the single best answer sentence from the retrieved *hits*.
+
+    Each hit's text is split into sentences via :func:`split_sentences`.
+    Every sentence is scored by **keyword density**: the square of
+    overlapping question keywords divided by the sentence length in
+    keywords.  This rewards short, targeted sentences that pack many
+    question-relevant words and penalises long sentences that rephrase
+    the question without delivering the answer.  The highest-scoring
+    sentence across all hits is returned.  When the winning sentence
+    comes from a hit that carries a ``page`` field, a page tag like
+    ``" (page 5)"`` is appended.
+
+    Returns an empty string when *hits* is empty or no sentence shares
+    any keywords with the question.
+    """
+    if not hits:
+        return ""
+
+    q_kw = keyword_set(question)
+    best_sent = ""
+    best_score = -1.0
+    best_page = None
+
+    for hit in hits:
+        for sent in split_sentences(hit.get("text", "")):
+            sent_kw = keyword_set(sent)
+            if not sent_kw:
+                continue
+
+            # Only sentences that share at least one keyword with the
+            # question are relevant — skip unrelated ones entirely.
+            overlap = len(q_kw & sent_kw)
+            if overlap == 0:
+                continue
+
+            # Keyword density: overlap² / sentence length.
+            #   - Squaring the overlap amplifies multi-keyword matches
+            #     (3 hits → 9, 1 hit → 1 — 9× difference, not 3×).
+            #   - Dividing by sentence length penalises long-winded
+            #     sentences that mention the topic but never answer it.
+            score = (overlap * overlap) / len(sent_kw)
+            if score > best_score:
+                best_score = score
+                best_sent = sent
+                best_page = hit.get("page")
+
+    if not best_sent:
+        return ""
+
+    if best_page is not None:
+        return f"{best_sent} (page {best_page})"
+    return best_sent
+
+
+# ---------------------------------------------------------------------------
+# 14. Project-facing helpers
+# ---------------------------------------------------------------------------
+
+
+def extract_citations(answer: str, hits: list[dict] | None = None) -> list[int]:
+    """Extract numeric PDF page citations from an answer string and optional hits.
+
+    Parses page references like ``(page 5)``, ``[Page 5]``, ``(p. 5)``,
+    or ``[p5]`` from the answer text.  When *hits* are provided their
+    page numbers are also collected as additional citations.
+
+    Returns a sorted list of unique page numbers.
+    """
+    pages: set[int] = set()
+
+    # Extract page tags from the answer text
+    if answer:
+        for m in re.finditer(r"(?:page|p\.?)\s*(\d+)", answer, re.IGNORECASE):
+            pages.add(int(m.group(1)))
+
+    # Collect page numbers from hits
+    if hits:
+        for hit in hits:
+            p = hit.get("page")
+            if p is not None:
+                pages.add(int(p))
+
+    return sorted(pages)
+
+
+def build_sources(hits: list[dict]) -> list[dict]:
+    """Convert retrieval hits into frontend-friendly source objects.
+
+    Each source carries *page*, *chunk_id*, *score*, and a *preview*
+    (first ~150 characters of the chunk text, truncated at the nearest
+    word boundary).  The *page* field lets the frontend render
+    clickable page links.
+    """
+    sources: list[dict] = []
+    for hit in hits:
+        text = hit.get("text", "")
+        if len(text) > 150:
+            preview = text[:150].rsplit(" ", 1)[0] + "…"
+        else:
+            preview = text
+        sources.append(
+            {
+                "page": hit.get("page"),
+                "chunk_id": hit.get("chunk_id"),
+                "score": hit.get("score"),
+                "preview": preview,
+            }
+        )
+    return sources
+
+
+def answer_document(
+    document: dict,
+    question: str,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    answer_model: str = "openrouter/free",
+) -> dict:
+    """Answer one question against a prepared document record.
+
+    Runs retrieval via :func:`search_document`, then either calls the
+    LLM (when ``OPENROUTER_API_KEY`` is set in the environment) or
+    falls back to local answer extraction via
+    :func:`best_sentence_answer`.  LLM call failures also fall back
+    gracefully.
+
+    Parameters
+    ----------
+    document : dict
+        A document record as returned by :func:`prepare_rag_document`.
+    question : str
+        The user's question.
+    top_k : int
+        Number of retrieval hits to use (default 3).
+    candidate_pool : int
+        How many candidates to fetch from FAISS for reranking (default 60).
+    answer_model : str
+        OpenRouter model id used for LLM answering (default
+        ``"openrouter/free"``).
+
+    Returns
+    -------
+    dict
+        Three keys:
+
+        * ``answer`` — the answer string (LLM or locally extracted)
+        * ``citations`` — sorted list of unique page numbers
+        * ``sources`` — frontend-ready source objects
+    """
+    import os
+
+    # ---- retrieval -------------------------------------------------------
+    hits = search_document(
+        question=question,
+        document=document,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+        history=document.get("history"),
+    )
+
+    # ---- answer generation -----------------------------------------------
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if api_key:
+        try:
+            answer = _llm_answer_from_hits(
+                question=question,
+                hits=hits,
+                api_key=api_key,
+                model=answer_model,
+            )
+        except Exception:
+            # LLM call failed (network, quota, …) → fall back to local
+            answer = best_sentence_answer(question, hits)
+    else:
+        answer = best_sentence_answer(question, hits)
+
+    # ---- citations & sources --------------------------------------------
+    citations = extract_citations(answer, hits)
+    sources = build_sources(hits)
+
+    return {"answer": answer, "citations": citations, "sources": sources}
+
+
+def _llm_answer_from_hits(
+    question: str,
+    hits: list[dict],
+    api_key: str,
+    model: str = "openrouter/free",
+) -> str:
+    """Call the OpenRouter LLM with retrieved chunks as context.
+
+    Formats each hit as a ``### [Page X]`` block and sends them
+    alongside *question* to the chat-completions endpoint.
+    """
+    import httpx
+    from openai import OpenAI
+
+    # Build PDF-like context from retrieved hits
+    parts: list[str] = []
+    for hit in hits:
+        page = hit.get("page", "?")
+        text = hit.get("text", "")
+        parts.append(f"### [Page {page}]\n{text}")
+    context = "\n\n".join(parts)
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
+        timeout=httpx.Timeout(30.0, connect=10.0),
+    )
+
+    system_prompt = (
+        "You answer messages only from the supplied PDF text. "
+        "Cite factual claims with [Page X]. "
+        "If the answer is not in the PDF, say that the document does not "
+        "provide enough information. "
+        "Never invent a page number. "
+        "Format all math with $...$ for inline and $$...$$ for display LaTeX. "
+        "Never use \\( ... \\) or \\[ ... \\] delimiters."
+    )
+
+    response = client.chat.completions.create(
+        model=model,
+        temperature=0.0,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": f"PDF text:\n{context}\n\nmessage: {question}",
+            },
+        ],
+    )
+    return response.choices[0].message.content or ""
+
+
+def append_history(
+    document: dict,
+    question: str,
+    result: dict,
+) -> list[dict]:
+    """Append a Q&A turn to the document's in-memory history.
+
+    Adds an entry with *question*, *answer*, and *citations* to
+    ``document["history"]`` and returns the updated history list.
+    The *document* dict is mutated in place.
+
+    Parameters
+    ----------
+    document : dict
+        A document record as returned by :func:`prepare_rag_document`.
+    question : str
+        The user's question.
+    result : dict
+        The result dict returned by :func:`answer_document` (must
+        contain at least ``answer`` and ``citations``).
+
+    Returns
+    -------
+    list[dict]
+        The updated history list (same object as ``document["history"]``).
+    """
+    entry = {
+        "question": question,
+        "answer": result.get("answer", ""),
+        "citations": result.get("citations", []),
+    }
+    document["history"].append(entry)
+    return document["history"]
+
+
+# ---------------------------------------------------------------------------
+# 15. Retrieval evaluation helpers
+# ---------------------------------------------------------------------------
+
+
+def normalize_for_match(text: str) -> str:
+    """Normalize text so that simple substring matching is more robust.
+
+    Lowercases, strips surrounding whitespace, replaces common
+    punctuation with spaces, and collapses repeated whitespace.
+    The result is a clean, lowercased string where only words and
+    single spaces remain — ideal for checking whether one piece of
+    text contains another regardless of formatting quirks.
+    """
+    if not text:
+        return ""
+    text = text.lower().strip()
+    # Replace punctuation and special characters with a space so word
+    # boundaries are preserved and concatenation artefacts are avoided.
+    text = re.sub(r"[.,;:!?\"'()\[\]{}…–—/]", " ", text)
+    # Collapse any run of whitespace into a single space
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def contains_any_answer(text: str, answers: list[str]) -> bool:
+    """Return ``True`` when at least one gold answer appears in *text*.
+
+    Both *text* and every candidate answer are first normalised with
+    :func:`normalize_for_match`.  Then a simple substring check decides
+    whether the answer is present.  This is deliberately straightforward:
+    it rewards exact word-level overlap and its behaviour is easy to
+    explain to someone learning about retrieval evaluation.
+    """
+    norm_text = normalize_for_match(text)
+    if not norm_text:
+        return False
+    for answer in answers:
+        norm_answer = normalize_for_match(answer)
+        if norm_answer and norm_answer in norm_text:
+            return True
+    return False
+
+
+def evaluate_questions(
+    eval_set: list[dict],
+    documents_by_name: dict[str, dict],
+    top_k: int = 3,
+    candidate_pool: int = 60,
+) -> "pandas.DataFrame":
+    """Run a simple end-to-end retrieval evaluation and return a table.
+
+    For every question in *eval_set* the function:
+
+    1. looks up the matching document by ``pdf_name``,
+    2. retrieves the top *k* chunks via :func:`search_document`,
+    3. extracts a local answer with :func:`best_sentence_answer`,
+    4. checks whether the correct page was retrieved
+       (``retrieval_hit``), and
+    5. checks whether the extracted answer contains any of the
+       gold answers (``answer_hit``).
+
+    Parameters
+    ----------
+    eval_set : list[dict]
+        Each record describes one test question and must provide:
+
+        - ``question`` (str) — the question to ask
+        - ``pdf_name`` (str) — which document to search (must be a
+          key in *documents_by_name*)
+        - ``answer_page`` (int | list[int], optional) — the PDF page (or pages)
+          that contain the answer.  When omitted, ``retrieval_hit``
+          will be ``None`` ("not evaluated").
+        - ``answers`` (list[str]) — one or more acceptable gold
+          answer strings
+
+    documents_by_name : dict[str, dict]
+        Mapping from ``pdf_name`` to prepared document records, as
+        returned by :func:`prepare_rag_document`.
+    top_k : int
+        Number of retrieval hits to use (default 3).
+    candidate_pool : int
+        How many FAISS candidates to fetch before reranking (default 60).
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per question.  Columns:
+
+        - ``question`` — the original question text
+        - ``pdf_name`` — which document was searched
+        - ``answer_page`` — the expected page(s) from the eval record
+        - ``retrieved_pages`` — list of page numbers found by retrieval
+        - ``local_answer`` — the best sentence extracted from hits
+        - ``retrieval_hit`` — ``True`` when at least one expected page
+          appears in the retrieved pages
+        - ``answer_hit`` — ``True`` when the local answer contains any
+          of the gold answers (checked via :func:`contains_any_answer`)
+    """
+    import pandas as pd  # type: ignore[import-untyped]
+
+    rows: list[dict] = []
+
+    for item in eval_set:
+        question = item["question"]
+        pdf_name = item["pdf_name"]
+        answer_page = item.get("answer_page")
+        gold_answers = item.get("answers", [])
+
+        # Normalise answer_page to a set of ints so we can handle both
+        # a single page number and a list of pages the same way.
+        # When answer_page is missing we leave target_pages empty and
+        # mark retrieval_hit as None ("not evaluated").
+        if answer_page is None:
+            target_pages: set[int] = set()
+        elif isinstance(answer_page, (int, float)):
+            target_pages = {int(answer_page)}
+        else:
+            target_pages = {int(p) for p in answer_page}
+
+        # --- look up the document ----------------------------------------
+        document = documents_by_name.get(pdf_name)
+        if document is None:
+            # PDF not found in the provided mapping — record a miss
+            rows.append(
+                {
+                    "question": question,
+                    "pdf_name": pdf_name,
+                    "answer_page": answer_page,
+                    "retrieved_pages": [],
+                    "local_answer": "",
+                    "retrieval_hit": False,
+                    "answer_hit": False,
+                }
+            )
+            continue
+
+        # --- retrieval ---------------------------------------------------
+        hits = search_document(
+            question=question,
+            document=document,
+            top_k=top_k,
+            candidate_pool=candidate_pool,
+        )
+
+        retrieved_pages = sorted(
+            {h["page"] for h in hits if h.get("page") is not None}
+        )
+        retrieval_hit = (
+            bool(target_pages & set(retrieved_pages))
+            if target_pages
+            else None  # answer_page was not provided — skip this metric
+        )
+
+        # --- local answer extraction -------------------------------------
+        local_answer = best_sentence_answer(question, hits)
+        answer_hit = (
+            contains_any_answer(local_answer, gold_answers)
+            if gold_answers
+            else False
+        )
+
+        rows.append(
+            {
+                "question": question,
+                "pdf_name": pdf_name,
+                "answer_page": answer_page,
+                "retrieved_pages": retrieved_pages,
+                "local_answer": local_answer,
+                "retrieval_hit": retrieval_hit,
+                "answer_hit": answer_hit,
+            }
+        )
+
+    return pd.DataFrame(rows)
